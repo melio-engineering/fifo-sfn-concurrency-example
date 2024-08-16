@@ -1,0 +1,195 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  GenerateJobCount:
+    Description: The number of jobs to generate in the loader function
+    Type: Number
+    Default: "10000"
+  MaxConcurrency:
+    Description: Set the maximum concurrency for this stack
+    Type: Number
+    Default: "200"
+
+Globals:
+  Function:
+    Handler: index.handler
+    Runtime: nodejs20.x
+    MemorySize: 256
+    Timeout: 60
+
+Resources:
+  loader:
+    # This function is not really part of the solution, but is placed here for convenience to generate fake jobs
+    # to be processed.
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Loads the entry queue with tasks
+      InlineCode: |
+        const { SQSClient, SendMessageBatchCommand } = require("@aws-sdk/client-sqs");
+
+        const QUEUE_URL = process.env.ENTRY_QUEUE_URL;
+        const JOBS = process.env.GENERATE_JOB_COUNT;
+        const sqs = new SQSClient();
+
+        exports.handler = async () => {
+          for (let i = 0; i < JOBS / 10; i++) {
+            const entries = [];
+            for (let j = 0; j < 10; j++) {
+              entries.push({
+                Id: ((i*10) + (j+1)).toString(),
+                MessageBody: JSON.stringify({
+                  jobId: ((i*10) + (j+1)).toString(),
+                  timestamp: new Date(),
+                }),
+              });
+            }
+
+            const params = {
+              Entries: entries,
+              QueueUrl: QUEUE_URL,
+            };
+
+            console.log("Sending", params);
+
+            await sqs.send(new SendMessageBatchCommand(params));
+          }
+        };
+
+      Environment:
+        Variables:
+          ENTRY_QUEUE_URL: !Ref entry
+          GENERATE_JOB_COUNT: !Ref GenerateJobCount
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt entry.QueueName
+
+  entry:
+    Type: AWS::SQS::Queue
+    Description: A general queue for incoming tasks
+    Properties:
+      MessageRetentionPeriod: 345600
+
+  enqueuer:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Enqueues tasks from the entry queue and maps the concurrency to the FIFO queue
+      InlineCode: |
+        const { SQSClient, SendMessageCommand } = require("@aws-sdk/client-sqs");
+        const crypto = require("crypto");
+
+        const QUEUE_URL = process.env.TASKS_QUEUE_URL;
+        const CONCURRENCY = process.env.MAX_CONCURRENCY;
+        const sqs = new SQSClient();
+
+        exports.handler = async (event) => {
+          const params = {
+            MessageBody: event.Records[0].body,
+            QueueUrl: QUEUE_URL,
+            // This is where we actually set our concurrency number
+            MessageGroupId: (Math.floor(Math.random() * CONCURRENCY) + 1).toString(),
+            MessageDeduplicationId: crypto.randomUUID(),
+          };
+
+          console.log("Sending", params);
+
+          await sqs.send(new SendMessageCommand(params));
+        };
+      Events:
+        entry:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt entry.Arn
+            BatchSize: 1
+      Environment:
+        Variables:
+          TASKS_QUEUE_URL: !Ref tasks
+          MAX_CONCURRENCY: "MaxConcurrency"
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt tasks.QueueName
+
+  tasks:
+    Type: AWS::SQS::Queue
+    Description: The tasks queue, configured as FIFO to utilize for concurrency
+    Properties:
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      MessageRetentionPeriod: 345600
+      VisibilityTimeout: 60
+
+  executor:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Executes tasks from the FIFO queue
+      InlineCode: |
+        const { SFNClient, StartExecutionCommand } = require("@aws-sdk/client-sfn");
+
+        const sfnClient = new SFNClient();
+
+        exports.handler = async (event) => {
+          const params = {
+            stateMachineArn: process.env.SIMULATEWORK_STATE_MACHINE_ARN,
+            input: JSON.stringify({
+              randomSleep: (Math.floor(Math.random() * 5) + 18),
+              event,
+            })
+          }
+
+          await sfnClient.send(new StartExecutionCommand(params));
+
+          // We response with a failure so that we can take control over the message
+          return {
+            batchItemFailures: event.Records.map((r) => ({
+              itemIdentifier: r.messageId,
+            })),
+          }
+        };
+
+      Events:
+        tasks:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt tasks.Arn
+            BatchSize: 1
+            # We must set the response type to ReportBatchItemFailures so that the above response is
+            # respected by the Lambda Trigger service
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+      Environment:
+        Variables:
+          SIMULATEWORK_STATE_MACHINE_ARN: !Ref simulateWork
+      Policies:
+        - StepFunctionsExecutionPolicy:
+            StateMachineName: !GetAtt simulateWork.Name
+
+  simulateWork:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub "${AWS::StackName}-SimulateWork"
+      Definition:
+        Comment: A state machine that fakes processing doing some work
+        StartAt: Simulate Work
+        States:
+          Simulate Work:
+            Type: Wait
+            Next: Mark task completed
+            SecondsPath: "$.randomSleep"
+          Mark task completed:
+            # It's important to delete the message from the FIFO queue so the next message can process
+            Type: Task
+            End: true
+            Parameters:
+              QueueUrl: "${CONFIFO_TASKS}"
+              ReceiptHandle.$: "$.event.Records[0].receiptHandle"
+            Resource: arn:aws:states:::aws-sdk:sqs:deleteMessage
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - sqs:DeleteMessage
+              Resource: !GetAtt tasks.Arn
+      Type: STANDARD
+      DefinitionSubstitutions:
+        CONFIFO_TASKS: !Ref tasks
