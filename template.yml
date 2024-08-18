@@ -105,7 +105,7 @@ Resources:
       Environment:
         Variables:
           TASKS_QUEUE_URL: !Ref tasks
-          MAX_CONCURRENCY: "MaxConcurrency"
+          MAX_CONCURRENCY: !Ref MaxConcurrency
       Policies:
         - SQSSendMessagePolicy:
             QueueName: !GetAtt tasks.QueueName
@@ -139,7 +139,7 @@ Resources:
 
           await sfnClient.send(new StartExecutionCommand(params));
 
-          // We response with a failure so that we can take control over the message
+          // We respond with a failure so that we can take control over the message
           return {
             batchItemFailures: event.Records.map((r) => ({
               itemIdentifier: r.messageId,
