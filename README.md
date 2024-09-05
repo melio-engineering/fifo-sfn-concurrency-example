@@ -1,6 +1,6 @@
 # Limiting StepFunction Concurrency with SQS FIFO
 
-This repository contains a working example of the [Taming StepFunction’s Concurrency With SQS](#todo) blog post.
+This repository contains a working example of the [Taming StepFunction’s Concurrency With SQS](https://medium.com/p/c678187a02b1) blog post.
 
 ## Usage
 
